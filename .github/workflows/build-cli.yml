@@ -1,33 +1,29 @@
-name: Build sing-box oldstable (Android and CLI)
+name: Build sing-box CLI and release
 
+# Manually triggered only: Actions -> Build sing-box CLI and release -> Run workflow.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag or temporary tag when building from commit hash (e.g. 1.13.0-rc.4)'
+        description: 'Release version, used for file names and the v{version} tag (e.g. 1.14.3-reF1nd)'
         required: true
-      commit_hash:
-        description: 'Optional commit hash to build from (overrides version tag)'
-        required: false
-        default: ''
-      build_cli:
-        description: 'Build CLI'
+        type: string
+      prerelease:
+        description: 'Create the GitHub Release as a pre-release'
         required: false
         type: boolean
-        default: true
-      build_android_gui:
-        description: 'Build Android'
-        required: false
-        type: boolean
-        default: true
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.version }}
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '~1.25.12'
-  GO_VERSION_DARWIN: '^1.25.3'
+  GO_VERSION: '1.26.8'
+  GO_VERSION_DARWIN: '1.26.8'
+
+permissions:
+  contents: read
 
 jobs:
   resolve_source:
@@ -39,8 +35,8 @@ jobs:
       - name: Checkout sing-box
         uses: actions/checkout@v6
         with:
-          repository: reF1nd/sing-box
-          ref: ${{ inputs.commit_hash != '' && inputs.commit_hash || format('v{0}', inputs.version) }}
+          repository: stormcream/sing-box
+          ref: my-stable
           path: sing-box
           fetch-depth: 1
 
@@ -54,12 +50,11 @@ jobs:
           fi
           source_sha=$(git -C sing-box rev-parse HEAD)
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
-          echo "Resolved sing-box source: ${source_sha}"
+          echo "Resolved sing-box source: ${source_sha} (stormcream/sing-box@my-stable)"
         env:
           INPUT_VERSION: ${{ inputs.version }}
 
   build_cli:
-    if: ${{ github.event.inputs.build_cli == 'true' }}
     name: Build CLI ${{ matrix.platform }}-${{ matrix.arch }} ${{ matrix.variant || matrix.legacy_name }}
     runs-on: ${{ matrix.os }}
     needs: resolve_source
@@ -310,7 +305,7 @@ jobs:
       - name: Checkout sing-box
         uses: actions/checkout@v6
         with:
-          repository: reF1nd/sing-box
+          repository: stormcream/sing-box
           ref: ${{ needs.resolve_source.outputs.source_sha }}
           path: sing-box
           fetch-depth: 1
@@ -320,7 +315,7 @@ jobs:
         run: |
           set -xeuo pipefail
           cd sing-box
-          TAG="v${{ github.event.inputs.version }}"
+          TAG="v${{ inputs.version }}"
           git tag -f "${TAG}" "${{ needs.resolve_source.outputs.source_sha }}"
 
       - name: Cache Go for macOS 10.13
@@ -430,11 +425,16 @@ jobs:
             TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_WINDOWS)
           elif [[ "${{ matrix.naive }}" == "true" ]]; then
             TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS)
+          elif [[ "${{ matrix.legacy_macos }}" == "true" ]]; then
+            TAGS=$(sed 's/,with_usbip//' sing-box/release/DEFAULT_BUILD_TAGS_OTHERS)
           else
             TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_OTHERS)
           fi
           if [[ "${{ matrix.naive }}" == "true" && "${TAGS}" != *with_naive_outbound* ]]; then
             TAGS="${TAGS},with_naive_outbound"
+          fi
+          if [[ -f sing-box/include/ebpf.go && ("${{ matrix.platform }}" == "linux" || "${{ matrix.platform }}" == "android") && "${TAGS}" != *with_ebpf* ]]; then
+            TAGS="${TAGS},with_ebpf"
           fi
           ARCHIVE_SUFFIX=""
 
@@ -477,7 +477,7 @@ jobs:
           fi
           go build -v -trimpath -o "dist/${{ matrix.binary }}" \
             -tags "${{ steps.env.outputs.tags }}" \
-            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ github.event.inputs.version }} ${LDFLAGS_SHARED} -s -w -buildid=" \
+            -ldflags "-X github.com/sagernet/sing-box/constant.Version=${{ inputs.version }} ${LDFLAGS_SHARED} -s -w -buildid=" \
             ./cmd/sing-box
         env:
           LDFLAGS_SHARED: ${{ steps.env.outputs.ldflags }}
@@ -519,7 +519,7 @@ jobs:
         shell: bash
         run: |
           cd sing-box/dist
-          DIR_NAME="sing-box-${{ github.event.inputs.version }}-linux-${{ matrix.arch }}${{ steps.env.outputs.archive_suffix }}"
+          DIR_NAME="sing-box-${{ inputs.version }}-linux-${{ matrix.arch }}${{ steps.env.outputs.archive_suffix }}"
           mkdir -p "$DIR_NAME"
           cp ../LICENSE "$DIR_NAME/"
           cp sing-box "$DIR_NAME/"
@@ -535,7 +535,7 @@ jobs:
         shell: pwsh
         run: |
           cd sing-box/dist
-          $DIR_NAME = "sing-box-${{ github.event.inputs.version }}-windows-${{ matrix.arch }}"
+          $DIR_NAME = "sing-box-${{ inputs.version }}-windows-${{ matrix.arch }}"
           mkdir "$DIR_NAME"
           Copy-Item ../LICENSE "$DIR_NAME/"
           Copy-Item sing-box.exe "$DIR_NAME/"
@@ -551,7 +551,7 @@ jobs:
         if: matrix.platform == 'darwin'
         run: |
           cd sing-box/dist
-          DIR_NAME="sing-box-${{ github.event.inputs.version }}-darwin-${{ matrix.arch }}"
+          DIR_NAME="sing-box-${{ inputs.version }}-darwin-${{ matrix.arch }}"
           if [[ -n "${{ matrix.legacy_name }}" ]]; then
             DIR_NAME="${DIR_NAME}-legacy-${{ matrix.legacy_name }}"
           fi
@@ -565,7 +565,7 @@ jobs:
         if: matrix.platform == 'android'
         run: |
           cd sing-box/dist
-          DIR_NAME="sing-box-${{ github.event.inputs.version }}-android-${{ matrix.arch }}"
+          DIR_NAME="sing-box-${{ inputs.version }}-android-${{ matrix.arch }}"
           mkdir -p "$DIR_NAME"
           cp ../LICENSE "$DIR_NAME/"
           cp sing-box "$DIR_NAME/"
@@ -578,234 +578,21 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: sing-box/dist/*
 
-  build_android_library:
-    if: ${{ github.event.inputs.build_android_gui == 'true' }}
-    name: Build Android library (${{ matrix.go_arch }})
+  release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: resolve_source
-    strategy:
-      fail-fast: false
-      matrix:
-        go_arch: ['386', amd64, arm, arm64]
-    steps:
-      - name: Checkout sing-box
-        uses: actions/checkout@v6
-        with:
-          repository: reF1nd/sing-box
-          ref: ${{ needs.resolve_source.outputs.source_sha }}
-          path: sing-box
-          fetch-depth: 1
-
-      - name: Set build tag
-        run: git -C sing-box tag -f "v${{ github.event.inputs.version }}" "${{ needs.resolve_source.outputs.source_sha }}"
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
-      - name: Cache Go modules
-        uses: actions/cache@v5
-        with:
-          path: ~/go/pkg/mod
-          key: go-mod-linux-${{ hashFiles('sing-box/go.sum') }}
-          restore-keys: go-mod-linux-
-
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28
-
-      - name: Setup OpenJDK
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Build library
-        run: |
-          set -euo pipefail
-          cd sing-box
-          make lib_install
-          export PATH="$PATH:$(go env GOPATH)/bin"
-          go run ./cmd/internal/build_libbox -target android -platform android/${{ matrix.go_arch }}
-          mkdir -p "dist/${{ matrix.go_arch }}"
-          mv libbox.aar libbox-legacy.aar "dist/${{ matrix.go_arch }}"
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-
-      - name: Upload library
-        uses: actions/upload-artifact@v7
-        with:
-          name: android-library-${{ matrix.go_arch }}
-          path: sing-box/dist
-          compression-level: 0
-
-  build_android:
-    if: ${{ github.event.inputs.build_android_gui == 'true' }}
-    name: Build Android (${{ matrix.variant }})
-    runs-on: ubuntu-latest
-    needs: [resolve_source, build_android_library]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - variant: other
-            task: :app:assembleOtherRelease
-            output: app/build/outputs/apk/other/release/*.apk
-          - variant: other-legacy
-            task: :app:assembleOtherLegacyRelease
-            output: app/build/outputs/apk/otherLegacy/release/*.apk
-    steps:
-      - name: Checkout sing-box
-        uses: actions/checkout@v6
-        with:
-          repository: reF1nd/sing-box
-          ref: ${{ needs.resolve_source.outputs.source_sha }}
-          path: sing-box
-          fetch-depth: 1
-
-      - name: Set build tag
-        run: git -C sing-box tag -f "v${{ github.event.inputs.version }}" "${{ needs.resolve_source.outputs.source_sha }}"
-
-      - name: Checkout sing-box-for-android
-        uses: actions/checkout@v6
-        with:
-          repository: reF1nd/sing-box-for-android
-          ref: reF1nd-oldstable
-          path: sing-box-for-android
-
-      - name: Checkout submodule recursive
-        run: git -C sing-box-for-android submodule update --init --recursive -v
-
-      - name: Setup Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: false
-
-      - name: Restore Go modules
-        uses: actions/cache/restore@v5
-        with:
-          path: ~/go/pkg/mod
-          key: go-mod-linux-${{ hashFiles('sing-box/go.sum') }}
-          restore-keys: go-mod-linux-
-
-      - name: Cache Go tool builds
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/go-build
-          key: go-build-tools-linux-${{ hashFiles('sing-box/go.sum') }}
-          restore-keys: go-build-tools-linux-
-
-      - name: Setup Android NDK
-        id: setup-ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r28
-
-      - name: Setup OpenJDK
-        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
-        with:
-          distribution: temurin
-          java-version: 17
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
-        with:
-          cache-provider: basic
-
-      - name: Update VERSION_NAME for temporary tag
-        if: github.event.inputs.commit_hash != ''
-        run: |
-          set -euo pipefail
-          file="sing-box-for-android/version.properties"
-          sed -i "s/^VERSION_NAME=.*/VERSION_NAME=${{ github.event.inputs.version }}/" "$file"
-          grep '^VERSION_NAME=' "$file"
-
-      - name: Read version code from source
-        run: |
-          version_code=$(grep '^VERSION_CODE=' sing-box-for-android/version.properties | cut -d'=' -f2)
-          echo "VERSION_CODE=${version_code}" >> "$GITHUB_ENV"
-
-      - name: Download libraries
-        uses: actions/download-artifact@v8
-        with:
-          pattern: android-library-*
-          path: libbox-inputs
-          merge-multiple: true
-
-      - name: Merge libraries
-        run: |
-          set -euo pipefail
-          cd sing-box
-          go run ./cmd/internal/merge_aar -output ../libbox.aar ../libbox-inputs/*/libbox.aar
-          go run ./cmd/internal/merge_aar -output ../libbox-legacy.aar ../libbox-inputs/*/libbox-legacy.aar
-
-      - name: Prepare Android client
-        run: |
-          mkdir -p sing-box-for-android/app/libs
-          cp libbox.aar libbox-legacy.aar sing-box-for-android/app/libs/
-
-      - name: Decode Keystore
-        run: echo "${{ secrets.RELEASE_KEYSTORE_FILE }}" | base64 -d > sing-box-for-android/app/release.keystore
-
-      - name: Build APK
-        run: |
-          cd sing-box-for-android
-          chmod +x gradlew
-          ./gradlew --build-cache --parallel ${{ matrix.task }} \
-            -Pandroid.injected.signing.store.file=$(pwd)/app/release.keystore \
-            -Pandroid.injected.signing.store.password="${{ secrets.RELEASE_KEYSTORE_PASSWORD }}" \
-            -Pandroid.injected.signing.key.alias="${{ secrets.RELEASE_KEY_ALIAS }}" \
-            -Pandroid.injected.signing.key.password="${{ secrets.RELEASE_KEY_PASSWORD }}"
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-
-      - name: Prepare upload
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp sing-box-for-android/${{ matrix.output }} dist
-          if [[ "${{ matrix.variant }}" == "other" ]]; then
-            printf '{\n    "version_code": %s,\n    "version_name": "%s"\n}\n' \
-              "$VERSION_CODE" "${{ github.event.inputs.version }}" > dist/SFA-version-metadata.json
-            cat dist/SFA-version-metadata.json
-          fi
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: android-apk-${{ matrix.variant }}
-          path: dist
-
-  finalize_build:
-    name: Finalize build artifacts
-    runs-on: ubuntu-latest
-    needs: [resolve_source, build_cli, build_android_library, build_android]
-    if: ${{ always() && needs.resolve_source.result == 'success' && (inputs.build_cli || inputs.build_android_gui) && (!inputs.build_cli || needs.build_cli.result == 'success') && (!inputs.build_android_gui || (needs.build_android_library.result == 'success' && needs.build_android.result == 'success')) }}
+    needs: [resolve_source, build_cli]
     permissions:
       actions: read
-      contents: read
+      contents: write
       id-token: write
       attestations: write
       artifact-metadata: write
     steps:
       - name: Download CLI artifacts
-        if: inputs.build_cli
         uses: actions/download-artifact@v8
         with:
           pattern: binary-*
-          path: artifacts
-          merge-multiple: true
-
-      - name: Download Android artifacts
-        if: inputs.build_android_gui
-        uses: actions/download-artifact@v8
-        with:
-          pattern: android-apk-*
           path: artifacts
           merge-multiple: true
 
@@ -826,37 +613,31 @@ jobs:
           } | jq -s 'sort_by(.path)' > artifact-files.json
 
           jq -n \
-            --arg workflow '.github/workflows/build-oldstable.yml' \
             --arg repository "${{ github.repository }}" \
             --arg head_branch "${{ github.ref_name }}" \
             --arg head_sha "${{ github.sha }}" \
             --arg version "${{ inputs.version }}" \
+            --arg source_repository "stormcream/sing-box" \
+            --arg source_branch "my-stable" \
             --arg source_sha "${{ needs.resolve_source.outputs.source_sha }}" \
             --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson run_id "${{ github.run_id }}" \
             --argjson run_attempt "${{ github.run_attempt }}" \
-            --argjson build_cli "${{ inputs.build_cli }}" \
-            --argjson build_android_gui "${{ inputs.build_android_gui }}" \
-            --argjson build_windows_gui false \
-            --argjson build_linux_gui false \
             --slurpfile artifact_files artifact-files.json \
             '{
               schema_version: 1,
-              workflow: $workflow,
               repository: $repository,
               head_branch: $head_branch,
               head_sha: $head_sha,
               run_id: $run_id,
               run_attempt: $run_attempt,
               version: $version,
-              source_sha: $source_sha,
-              built_at: $built_at,
-              build: {
-                cli: $build_cli,
-                android_gui: $build_android_gui,
-                windows_gui: $build_windows_gui,
-                linux_gui: $build_linux_gui
+              source: {
+                repository: $source_repository,
+                branch: $source_branch,
+                sha: $source_sha
               },
+              built_at: $built_at,
               artifacts: $artifact_files[0]
             }' > build-manifest.json
 
@@ -870,67 +651,36 @@ jobs:
             artifacts/**
             build-manifest.json
 
-      - name: Upload build manifest
-        uses: actions/upload-artifact@v7
-        with:
-          name: build-manifest
-          path: build-manifest.json
-
-  cache_gc:
-    name: Cache GC
-    if: always()
-    runs-on: ubuntu-latest
-    needs: finalize_build
-    permissions:
-      actions: write
-    steps:
-      - name: Delete superseded caches
+      - name: Generate release notes
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |-
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ needs.resolve_source.outputs.source_sha }}
+        run: |
           set -euo pipefail
-          gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate \
-            --jq '.actions_caches[] | [.id, .ref, .created_at, .last_accessed_at, .size_in_bytes, .key] | @tsv' > "$RUNNER_TEMP/caches.tsv"
-          python3 - "$GITHUB_REPOSITORY" "$RUNNER_TEMP/caches.tsv" <<'EOF'
-          import re
-          import subprocess
-          import sys
+          built_at=$(jq -r '.built_at' build-manifest.json)
+          {
+            echo "## sing-box v${VERSION}"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Version | \`${VERSION}\` |"
+            echo "| Source | [stormcream/sing-box@my-stable](https://github.com/stormcream/sing-box/tree/my-stable) |"
+            echo "| Source commit | [\`${SOURCE_SHA}\`](https://github.com/stormcream/sing-box/commit/${SOURCE_SHA}) |"
+            echo "| Built at | ${built_at} |"
+            echo "| Build run | [${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
+          } > release-notes.md
+          cat release-notes.md
 
-          repository, list_path = sys.argv[1], sys.argv[2]
-          budget = 9 * 1024 * 1024 * 1024
-          rows = []
-          with open(list_path) as list_file:
-              for line in list_file:
-                  cache_id, ref, created_at, accessed_at, size, key = line.rstrip("\n").split("\t")
-                  family = key
-                  while True:
-                      stripped = re.sub(r"-[0-9a-f]{16,}$", "", family)
-                      if stripped == family:
-                          break
-                      family = stripped
-                  rows.append({
-                      "id": cache_id, "ref": ref, "created": created_at,
-                      "accessed": accessed_at, "size": int(size), "key": key,
-                      "family": family,
-                  })
-          newest = {}
-          for row in rows:
-              group = (row["ref"], row["family"])
-              if group not in newest or row["created"] > newest[group]["created"]:
-                  newest[group] = row
-          doomed = [row for row in rows if newest[(row["ref"], row["family"])] is not row]
-          kept = [row for row in rows if newest[(row["ref"], row["family"])] is row]
-          total = sum(row["size"] for row in kept)
-          for row in sorted(kept, key=lambda entry: entry["accessed"]):
-              if total <= budget:
-                  break
-              doomed.append(row)
-              total -= row["size"]
-          for row in doomed:
-              print(f"delete {row['size'] >> 20}MB {row['key']} ({row['ref']})")
-              subprocess.run(
-                  ["gh", "api", "-X", "DELETE", f"repos/{repository}/actions/caches/{row['id']}"],
-                  check=False,
-              )
-          print(f"kept {len(rows) - len(doomed)} caches, {total >> 20}MB total")
-          EOF
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: v${{ inputs.version }}
+          name: v${{ inputs.version }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ inputs.prerelease }}
+          body_path: release-notes.md
+          files: |
+            artifacts/*
+            build-manifest.json
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
