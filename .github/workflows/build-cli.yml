@@ -206,6 +206,28 @@ jobs:
             variant: purego
             artifact_name: binary-windows-amd64v3
             naive: true
+          - platform: windows
+            arch: amd64
+            os: ubuntu-26.04
+            goos: windows
+            goarch: amd64
+            goamd64: v1
+            binary: sing-box.exe
+            artifact_name: binary-windows-amd64-legacy-windows-7
+            legacy_win7: true
+            legacy_name: windows-7
+            naive: false
+          - platform: windows
+            arch: 386
+            os: ubuntu-26.04
+            goos: windows
+            goarch: 386
+            goamd64: ''
+            binary: sing-box.exe
+            artifact_name: binary-windows-386-legacy-windows-7
+            legacy_win7: true
+            legacy_name: windows-7
+            naive: false
           - platform: darwin
             arch: arm64
             os: macos-latest
@@ -313,7 +335,7 @@ jobs:
           cache: false
 
       - name: Setup Go
-        if: matrix.platform != 'darwin'
+        if: matrix.platform != 'darwin' && matrix.legacy_win7 != true
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
@@ -360,6 +382,26 @@ jobs:
           echo "PATH=$HOME/go/go_osx/bin:$PATH" >> "$GITHUB_ENV"
           echo "GOROOT=$HOME/go/go_osx" >> "$GITHUB_ENV"
 
+      - name: Cache Go for Windows 7
+        if: matrix.legacy_win7 == true
+        id: cache-go-for-windows7
+        uses: actions/cache@v5
+        with:
+          path: ~/go/go_win7
+          key: go-win7-${{ hashFiles('sing-box/.github/setup_go_for_windows7.sh') }}
+
+      - name: Setup Go for Windows 7
+        if: matrix.legacy_win7 == true && steps.cache-go-for-windows7.outputs.cache-hit != 'true'
+        run: sing-box/.github/setup_go_for_windows7.sh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Activate Go for Windows 7
+        if: matrix.legacy_win7 == true
+        run: |
+          echo "PATH=$HOME/go/go_win7/bin:$PATH" >> "$GITHUB_ENV"
+          echo "GOROOT=$HOME/go/go_win7" >> "$GITHUB_ENV"
+
       - name: Cache Go modules for Darwin
         if: matrix.platform == 'darwin'
         uses: actions/cache@v5
@@ -368,8 +410,8 @@ jobs:
           key: go-mod-macos-${{ hashFiles('sing-box/go.sum') }}
           restore-keys: go-mod-macos-
 
-      - name: Cache Go modules for Linux and Android
-        if: matrix.platform == 'linux' || matrix.platform == 'android'
+      - name: Cache Go modules for Linux, Android and Windows 7
+        if: matrix.platform == 'linux' || matrix.platform == 'android' || matrix.legacy_win7 == true
         uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
@@ -377,7 +419,7 @@ jobs:
           restore-keys: go-mod-linux-
 
       - name: Cache Go modules for Windows
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && matrix.legacy_win7 != true
         uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
@@ -443,7 +485,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "${{ matrix.platform }}" == "windows" ]]; then
+          if [[ "${{ matrix.legacy_win7 }}" == "true" ]]; then
+            TAGS=$(sed 's/,with_usbip//' sing-box/release/DEFAULT_BUILD_TAGS_OTHERS)
+          elif [[ "${{ matrix.platform }}" == "windows" ]]; then
             TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS_WINDOWS)
           elif [[ "${{ matrix.naive }}" == "true" ]]; then
             TAGS=$(cat sing-box/release/DEFAULT_BUILD_TAGS)
@@ -553,7 +597,7 @@ jobs:
           if [ -f libcronet.so ]; then rm -f libcronet.so; fi
 
       - name: Archive (Windows)
-        if: matrix.platform == 'windows'
+        if: matrix.platform == 'windows' && matrix.legacy_win7 != true
         shell: pwsh
         run: |
           cd sing-box/dist
@@ -568,6 +612,17 @@ jobs:
           Remove-Item -Recurse "$DIR_NAME"
           Remove-Item sing-box.exe
           if (Test-Path libcronet.dll) { Remove-Item libcronet.dll }
+
+      - name: Archive (Windows 7)
+        if: matrix.legacy_win7 == true
+        run: |
+          cd sing-box/dist
+          DIR_NAME="sing-box-${{ inputs.version }}-windows-${{ matrix.arch }}-legacy-${{ matrix.legacy_name }}"
+          mkdir -p "$DIR_NAME"
+          cp ../LICENSE "$DIR_NAME/"
+          cp sing-box.exe "$DIR_NAME/"
+          zip -r "$DIR_NAME.zip" "$DIR_NAME"
+          rm -rf "$DIR_NAME" sing-box.exe
 
       - name: Archive (Darwin)
         if: matrix.platform == 'darwin'
