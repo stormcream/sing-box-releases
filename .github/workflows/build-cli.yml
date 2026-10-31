@@ -8,6 +8,11 @@ on:
         description: 'Release version, used for file names and the v{version} tag (e.g. 1.14.3-reF1nd)'
         required: true
         type: string
+      source_sha:
+        description: 'Optional sing-box commit SHA to build (40 hex chars; defaults to the my-stable branch head)'
+        required: false
+        type: string
+        default: ''
       prerelease:
         description: 'Create the GitHub Release as a pre-release'
         required: false
@@ -19,8 +24,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.26.8'
-  GO_VERSION_DARWIN: '1.26.8'
+  GO_VERSION: '1.26.10'
+  GO_VERSION_DARWIN: '1.26.10'
 
 permissions:
   contents: read
@@ -29,6 +34,7 @@ jobs:
   resolve_source:
     name: Resolve sing-box source
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
@@ -36,7 +42,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: stormcream/sing-box
-          ref: my-stable
+          ref: ${{ inputs.source_sha || 'my-stable' }}
           path: sing-box
           fetch-depth: 1
 
@@ -48,16 +54,27 @@ jobs:
             echo "invalid version: $INPUT_VERSION" >&2
             exit 1
           fi
+          if [[ -n "$INPUT_SOURCE_SHA" && ! "$INPUT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "invalid source SHA: $INPUT_SOURCE_SHA" >&2
+            exit 1
+          fi
           source_sha=$(git -C sing-box rev-parse HEAD)
+          if [[ -n "$INPUT_SOURCE_SHA" && "$source_sha" != "$INPUT_SOURCE_SHA" ]]; then
+            echo "resolved source ${source_sha} does not match requested ${INPUT_SOURCE_SHA}" >&2
+            exit 1
+          fi
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
-          echo "Resolved sing-box source: ${source_sha} (stormcream/sing-box@my-stable)"
+          echo "Resolved sing-box source: ${source_sha} (stormcream/sing-box@${INPUT_SOURCE_REF})"
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          INPUT_SOURCE_REF: ${{ inputs.source_sha || 'my-stable' }}
 
   build_cli:
     name: Build CLI ${{ matrix.platform }}-${{ matrix.arch }} ${{ matrix.variant || matrix.legacy_name }}
     runs-on: ${{ matrix.os }}
     needs: resolve_source
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       max-parallel: 13
@@ -318,6 +335,11 @@ jobs:
           TAG="v${{ inputs.version }}"
           git tag -f "${TAG}" "${{ needs.resolve_source.outputs.source_sha }}"
 
+      - name: Patch Go for Windows ARM64
+        if: matrix.platform == 'windows' && matrix.goarch == 'arm64' && hashFiles('sing-box/.github/patch_go_for_windows_arm64.sh') != ''
+        shell: bash
+        run: sing-box/.github/patch_go_for_windows_arm64.sh
+
       - name: Cache Go for macOS 10.13
         if: matrix.legacy_macos == true
         id: cache-go-for-macos1013
@@ -346,9 +368,9 @@ jobs:
           key: go-mod-macos-${{ hashFiles('sing-box/go.sum') }}
           restore-keys: go-mod-macos-
 
-      - name: Restore Go modules for Linux and Android
+      - name: Cache Go modules for Linux and Android
         if: matrix.platform == 'linux' || matrix.platform == 'android'
-        uses: actions/cache/restore@v5
+        uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
           key: go-mod-linux-${{ hashFiles('sing-box/go.sum') }}
@@ -365,7 +387,7 @@ jobs:
       - name: Setup Android NDK
         if: matrix.platform == 'android'
         id: setup-ndk
-        uses: nttld/setup-ndk@v1
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
         with:
           ndk-version: r28
           #local-cache: true
@@ -577,11 +599,14 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: sing-box/dist/*
+          compression-level: 0
+          retention-days: 7
 
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
     needs: [resolve_source, build_cli]
+    timeout-minutes: 45
     permissions:
       actions: read
       contents: write
@@ -613,12 +638,14 @@ jobs:
           } | jq -s 'sort_by(.path)' > artifact-files.json
 
           jq -n \
+            --arg workflow ".github/workflows/build-cli.yml" \
             --arg repository "${{ github.repository }}" \
             --arg head_branch "${{ github.ref_name }}" \
             --arg head_sha "${{ github.sha }}" \
             --arg version "${{ inputs.version }}" \
             --arg source_repository "stormcream/sing-box" \
             --arg source_branch "my-stable" \
+            --arg source_ref "${{ inputs.source_sha || 'my-stable' }}" \
             --arg source_sha "${{ needs.resolve_source.outputs.source_sha }}" \
             --arg built_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson run_id "${{ github.run_id }}" \
@@ -626,15 +653,18 @@ jobs:
             --slurpfile artifact_files artifact-files.json \
             '{
               schema_version: 1,
+              workflow: $workflow,
               repository: $repository,
               head_branch: $head_branch,
               head_sha: $head_sha,
               run_id: $run_id,
               run_attempt: $run_attempt,
               version: $version,
+              source_sha: $source_sha,
               source: {
                 repository: $source_repository,
                 branch: $source_branch,
+                ref: $source_ref,
                 sha: $source_sha
               },
               built_at: $built_at,
@@ -651,10 +681,18 @@ jobs:
             artifacts/**
             build-manifest.json
 
+      - name: Upload build manifest
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-manifest
+          path: build-manifest.json
+          retention-days: 7
+
       - name: Generate release notes
         env:
           VERSION: ${{ inputs.version }}
           SOURCE_SHA: ${{ needs.resolve_source.outputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_sha || 'my-stable' }}
         run: |
           set -euo pipefail
           built_at=$(jq -r '.built_at' build-manifest.json)
@@ -664,15 +702,27 @@ jobs:
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Version | \`${VERSION}\` |"
-            echo "| Source | [stormcream/sing-box@my-stable](https://github.com/stormcream/sing-box/tree/my-stable) |"
+            echo "| Source | [stormcream/sing-box@${SOURCE_REF}](https://github.com/stormcream/sing-box/commit/${SOURCE_SHA}) |"
             echo "| Source commit | [\`${SOURCE_SHA}\`](https://github.com/stormcream/sing-box/commit/${SOURCE_SHA}) |"
             echo "| Built at | ${built_at} |"
             echo "| Build run | [${GITHUB_RUN_ID}](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
           } > release-notes.md
           cat release-notes.md
 
+      - name: Delete existing release and tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release delete "$tag" --yes --cleanup-tag
+          fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${tag}" >/dev/null 2>&1 || true
+
       - name: Create release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: v${{ inputs.version }}
           name: v${{ inputs.version }}
@@ -684,3 +734,63 @@ jobs:
             build-manifest.json
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
+  cache_gc:
+    name: Cache GC
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [build_cli, release]
+    timeout-minutes: 15
+    permissions:
+      actions: write
+    steps:
+      - name: Delete superseded caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |-
+          set -euo pipefail
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate \
+            --jq '.actions_caches[] | [.id, .ref, .created_at, .last_accessed_at, .size_in_bytes, .key] | @tsv' > "$RUNNER_TEMP/caches.tsv"
+          python3 - "$GITHUB_REPOSITORY" "$RUNNER_TEMP/caches.tsv" <<'EOF'
+          import re
+          import subprocess
+          import sys
+
+          repository, list_path = sys.argv[1], sys.argv[2]
+          budget = 9 * 1024 * 1024 * 1024
+          rows = []
+          with open(list_path) as list_file:
+              for line in list_file:
+                  cache_id, ref, created_at, accessed_at, size, key = line.rstrip("\n").split("\t")
+                  family = key
+                  while True:
+                      stripped = re.sub(r"-[0-9a-f]{16,}$", "", family)
+                      if stripped == family:
+                          break
+                      family = stripped
+                  rows.append({
+                      "id": cache_id, "ref": ref, "created": created_at,
+                      "accessed": accessed_at, "size": int(size), "key": key,
+                      "family": family,
+                  })
+          newest = {}
+          for row in rows:
+              group = (row["ref"], row["family"])
+              if group not in newest or row["created"] > newest[group]["created"]:
+                  newest[group] = row
+          doomed = [row for row in rows if newest[(row["ref"], row["family"])] is not row]
+          kept = [row for row in rows if newest[(row["ref"], row["family"])] is row]
+          total = sum(row["size"] for row in kept)
+          for row in sorted(kept, key=lambda entry: entry["accessed"]):
+              if total <= budget:
+                  break
+              doomed.append(row)
+              total -= row["size"]
+          for row in doomed:
+              print(f"delete {row['size'] >> 20}MB {row['key']} ({row['ref']})")
+              subprocess.run(
+                  ["gh", "api", "-X", "DELETE", f"repos/{repository}/actions/caches/{row['id']}"],
+                  check=False,
+              )
+          print(f"kept {len(rows) - len(doomed)} caches, {total >> 20}MB total")
+          EOF
